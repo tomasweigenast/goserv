@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"reflect"
 	"time"
+
+	"github.com/tomasweigenast/goserv/codec"
 )
 
 // RequestHandler is a typed handler convenience alias.
@@ -24,8 +26,8 @@ type RouteDefiner interface {
 
 // routeConfig holds codec and middleware state shared by Server and RouteGroup.
 type routeConfig struct {
-	inputCodecs  []InputCodec
-	outputCodecs []OutputCodec
+	inputCodecs  []codec.InputCodec
+	outputCodecs []codec.OutputCodec
 	middlewares  []Middleware
 	logger       *slog.Logger
 }
@@ -48,11 +50,11 @@ type Server struct {
 // NewServer returns a Server configured with the given options.
 // JSONCodec and the built-in path patterns ("uuid", "regex") are registered by default.
 func NewServer(opts ...ServerOption) *Server {
-	jc := NewJSONCodec()
+	jc := codec.NewJSONCodec()
 	s := &Server{
 		routeConfig: routeConfig{
-			inputCodecs:  []InputCodec{jc},
-			outputCodecs: []OutputCodec{jc},
+			inputCodecs:  []codec.InputCodec{jc},
+			outputCodecs: []codec.OutputCodec{jc},
 			logger:       slog.Default(),
 		},
 		addr:              ":8080",
@@ -113,9 +115,8 @@ func (s *Server) Listen(ctx context.Context) error {
 func (s *Server) RegisterRouteGroup(prefix string, route any, opts ...GroupOption) *RouteGroup {
 	g := &RouteGroup{
 		routeConfig: routeConfig{
-			// Copy server codecs so group overrides don't mutate the server's slices.
-			inputCodecs:  append([]InputCodec(nil), s.inputCodecs...),
-			outputCodecs: append([]OutputCodec(nil), s.outputCodecs...),
+			inputCodecs:  append([]codec.InputCodec(nil), s.inputCodecs...),
+			outputCodecs: append([]codec.OutputCodec(nil), s.outputCodecs...),
 		},
 		s:      s,
 		prefix: prefix,

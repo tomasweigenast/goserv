@@ -1,4 +1,4 @@
-package goserv
+package codec
 
 import (
 	"encoding/json"

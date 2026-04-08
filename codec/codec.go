@@ -1,10 +1,6 @@
-package goserv
+package codec
 
-import (
-	"io"
-	"net/http"
-	"strconv"
-)
+import "io"
 
 // InputCodec decodes a request body into a Go value.
 // The active codec is selected by matching the request Content-Type header.
@@ -42,10 +38,10 @@ type BufferedOutputCodec interface {
 	Marshal(data any) ([]byte, error)
 }
 
-// selectInputCodec returns the first InputCodec that can handle contentType,
+// SelectInputCodec returns the first InputCodec that can handle contentType,
 // or the first registered codec when contentType is empty (no Content-Type header).
 // Returns nil if no codec matches, which should produce a 415 response.
-func selectInputCodec(codecs []InputCodec, contentType string) InputCodec {
+func SelectInputCodec(codecs []InputCodec, contentType string) InputCodec {
 	if contentType == "" && len(codecs) > 0 {
 		return codecs[0]
 	}
@@ -55,65 +51,4 @@ func selectInputCodec(codecs []InputCodec, contentType string) InputCodec {
 		}
 	}
 	return nil
-}
-
-// selectOutputCodec returns the first OutputCodec that can satisfy accept,
-// or the first registered codec when accept is empty (no Accept header).
-// Returns nil if no codec matches, which should produce a 406 response.
-func selectOutputCodec(codecs []OutputCodec, accept string) OutputCodec {
-	if accept == "" && len(codecs) > 0 {
-		return codecs[0]
-	}
-	for _, c := range codecs {
-		if c.CanEncode(accept) {
-			return c
-		}
-	}
-	return nil
-}
-
-func writeResponse(w http.ResponseWriter, r *http.Request, res Response, codecs []OutputCodec) {
-	for k, v := range res.Headers() {
-		w.Header().Set(k, v)
-	}
-
-	data := res.Data()
-	if data == nil {
-		w.WriteHeader(res.StatusCode())
-		return
-	}
-
-	codec := selectOutputCodec(codecs, r.Header.Get("Accept"))
-	if codec == nil {
-		w.WriteHeader(http.StatusNotAcceptable)
-		return
-	}
-
-	h := w.Header()
-	if h.Get("Content-Type") == "" {
-		h.Set("Content-Type", codec.ContentType())
-	}
-
-	if buf, ok := codec.(BufferedOutputCodec); ok {
-		// Buffered: marshal first, set Content-Length, then write.
-		// Headers are not yet committed — encoding errors still produce a clean response.
-		b, err := buf.Marshal(data)
-		if err != nil {
-			h.Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusInternalServerError)
-			_, _ = io.WriteString(w, `{"error":"internal server error encoding response"}`)
-			return
-		}
-		h.Set("Content-Length", strconv.Itoa(len(b)))
-		w.WriteHeader(res.StatusCode())
-		_, _ = w.Write(b)
-	} else {
-		// Streaming: write directly to the response; Go's http package will use
-		// chunked transfer encoding automatically.
-		w.WriteHeader(res.StatusCode())
-		if err := codec.Encode(w, data); err != nil {
-			// Headers already committed — cannot change the status code.
-			_ = err
-		}
-	}
 }

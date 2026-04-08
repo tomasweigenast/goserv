@@ -7,6 +7,8 @@ import (
 	"reflect"
 	"strconv"
 	"time"
+
+	"github.com/tomasweigenast/goserv/codec"
 )
 
 // ============================================================================
@@ -52,7 +54,7 @@ func WithLogger(logger *slog.Logger) RouteOption {
 
 // WithInputCodec appends an InputCodec to the codec list.
 // Codecs are tried in registration order against the request Content-Type header.
-func WithInputCodec(c InputCodec) RouteOption {
+func WithInputCodec(c codec.InputCodec) RouteOption {
 	return sharedOptionFunc(func(cfg *routeConfig) {
 		cfg.inputCodecs = append(cfg.inputCodecs, c)
 	})
@@ -60,7 +62,7 @@ func WithInputCodec(c InputCodec) RouteOption {
 
 // WithOutputCodec appends an OutputCodec to the codec list.
 // Codecs are tried in registration order against the request Accept header.
-func WithOutputCodec(c OutputCodec) RouteOption {
+func WithOutputCodec(c codec.OutputCodec) RouteOption {
 	return sharedOptionFunc(func(cfg *routeConfig) {
 		cfg.outputCodecs = append(cfg.outputCodecs, c)
 	})
@@ -69,10 +71,10 @@ func WithOutputCodec(c OutputCodec) RouteOption {
 // WithCodec registers c as an InputCodec, OutputCodec, or both.
 func WithCodec(c any) RouteOption {
 	return sharedOptionFunc(func(cfg *routeConfig) {
-		if ic, ok := c.(InputCodec); ok {
+		if ic, ok := c.(codec.InputCodec); ok {
 			cfg.inputCodecs = append(cfg.inputCodecs, ic)
 		}
-		if oc, ok := c.(OutputCodec); ok {
+		if oc, ok := c.(codec.OutputCodec); ok {
 			cfg.outputCodecs = append(cfg.outputCodecs, oc)
 		}
 	})

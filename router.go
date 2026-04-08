@@ -3,10 +3,14 @@ package goserv
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/tomasweigenast/goserv/codec"
 )
 
 // Package-level type descriptors — evaluated once at startup.
@@ -85,12 +89,12 @@ func (g *RouteGroup) Map(path string, handler any) {
 		case inTyp.Kind() == reflect.Struct:
 			bodyType := inTyp
 			setters[i] = func(args []reflect.Value, _ http.ResponseWriter, r *http.Request) (bool, Response) {
-				codec := selectInputCodec(inputCodecs, r.Header.Get("Content-Type"))
-				if codec == nil {
+				ic := codec.SelectInputCodec(inputCodecs, r.Header.Get("Content-Type"))
+				if ic == nil {
 					return false, errResponse(http.StatusUnsupportedMediaType, "unsupported media type")
 				}
 				ptr := reflect.New(bodyType)
-				if err := codec.Decode(r.Body, ptr.Interface()); err != nil {
+				if err := ic.Decode(r.Body, ptr.Interface()); err != nil {
 					return false, errResponse(http.StatusBadRequest, "invalid request body")
 				}
 				args[i] = ptr.Elem()
@@ -272,4 +276,57 @@ func isNilValue(v reflect.Value) bool {
 		return v.IsNil()
 	}
 	return false
+}
+
+func selectOutputCodec(codecs []codec.OutputCodec, accept string) codec.OutputCodec {
+	if accept == "" && len(codecs) > 0 {
+		return codecs[0]
+	}
+	for _, c := range codecs {
+		if c.CanEncode(accept) {
+			return c
+		}
+	}
+	return nil
+}
+
+func writeResponse(w http.ResponseWriter, r *http.Request, res Response, codecs []codec.OutputCodec) {
+	for k, v := range res.Headers() {
+		w.Header().Set(k, v)
+	}
+
+	data := res.Data()
+	if data == nil {
+		w.WriteHeader(res.StatusCode())
+		return
+	}
+
+	c := selectOutputCodec(codecs, r.Header.Get("Accept"))
+	if c == nil {
+		w.WriteHeader(http.StatusNotAcceptable)
+		return
+	}
+
+	h := w.Header()
+	if h.Get("Content-Type") == "" {
+		h.Set("Content-Type", c.ContentType())
+	}
+
+	if buf, ok := c.(codec.BufferedOutputCodec); ok {
+		b, err := buf.Marshal(data)
+		if err != nil {
+			h.Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = io.WriteString(w, `{"error":"internal server error encoding response"}`)
+			return
+		}
+		h.Set("Content-Length", strconv.Itoa(len(b)))
+		w.WriteHeader(res.StatusCode())
+		_, _ = w.Write(b)
+	} else {
+		w.WriteHeader(res.StatusCode())
+		if err := c.Encode(w, data); err != nil {
+			_ = err
+		}
+	}
 }
