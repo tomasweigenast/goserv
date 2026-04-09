@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/tomasweigenast/goserv/codec"
+	"github.com/tomasweigenast/goserv/pathparam"
 )
 
 // ============================================================================
@@ -122,7 +123,7 @@ func WithAddress(addr string) ServerOption {
 
 // WithPathPattern registers a named path parameter constraint factory.
 // The name is referenced in route patterns, e.g. :id[mypattern].
-func WithPathPattern(name string, factory PathPatternFactory) ServerOption {
+func WithPathPattern(name string, factory pathparam.PatternFactory) ServerOption {
 	return serverOptionFunc(func(s *Server) {
 		s.pathPatterns[name] = factory
 	})
@@ -139,8 +140,8 @@ func WithErrorHandler(h ErrorHandler) ServerOption {
 // WithPathParamDecoder registers a custom decoder for path parameters.
 // Use NewPathParamDecoder to wrap a plain parse function:
 //
-//	WithPathParamDecoder(NewPathParamDecoder(time.ParseDuration))
-func WithPathParamDecoder(dec PathParamDecoder) ServerOption {
+//	WithPathParamDecoder(pathparam.NewParamDecoder(time.ParseDuration))
+func WithPathParamDecoder(dec pathparam.ParamDecoder) ServerOption {
 	return serverOptionFunc(func(s *Server) {
 		s.pathParamDecoders[reflect.TypeOf(dec.Zero())] = dec
 	})

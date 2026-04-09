@@ -3,7 +3,7 @@ package goserv
 import (
 	"context"
 	"fmt"
-	"io"
+	"log/slog"
 	"net/http"
 	"reflect"
 	"strconv"
@@ -11,33 +11,31 @@ import (
 	"sync"
 
 	"github.com/tomasweigenast/goserv/codec"
+	"github.com/tomasweigenast/goserv/pathparam"
 )
 
-// Package-level type descriptors — evaluated once at startup.
-var (
-	ourContextType = reflect.TypeFor[*Context]()
-	stdContextType = reflect.TypeFor[context.Context]()
-	responseType   = reflect.TypeFor[Response]()
-	errorType      = reflect.TypeFor[error]()
-)
+// RequestHandler is a typed handler convenience alias.
+type RequestHandler func(r *Context) Response
 
-// returnPattern describes what a handler function returns.
-// Resolved once at registration time; never inspected at request time.
-type returnPattern int
+// RouteDefiner ensures groups passed to RegisterRouteGroup have the Routes method.
+type RouteDefiner interface {
+	Routes(g *RouteGroup)
+}
 
-const (
-	returnsNothing          returnPattern = iota
-	returnsResponse                       // func(...) Response
-	returnsData                           // func(...) T  (not Response, not error)
-	returnsError                          // func(...) error
-	returnsResponseAndError               // func(...) (Response, error)
-	returnsDataAndError                   // func(...) (T, error)
-)
+// routeConfig holds codec and middleware state shared by Server and RouteGroup.
+type routeConfig struct {
+	inputCodecs  []codec.InputCodec
+	outputCodecs []codec.OutputCodec
+	middlewares  []Middleware
+	logger       *slog.Logger
+}
 
-// argSetter is compiled once per parameter slot at route-registration time.
-// At request time it injects the correct value into args[i] with no branching.
-// Returns (false, errResponse) if injection fails (e.g. malformed path parameter).
-type argSetter func(args []reflect.Value, w http.ResponseWriter, r *http.Request) (ok bool, errResponse Response)
+// RouteGroup is a set of routes sharing a common prefix, codec list, and middleware chain.
+type RouteGroup struct {
+	routeConfig
+	s      *Server
+	prefix string
+}
 
 // Map registers handler under the given path pattern within this group.
 //
@@ -105,22 +103,22 @@ func (g *RouteGroup) Map(path string, handler any) {
 			pc := params[paramIdx]
 			paramIdx++
 
-			var pattern PathPattern
-			if pc.constraintName != "" {
-				factory, ok := g.s.pathPatterns[pc.constraintName]
+			var pattern pathparam.Pattern
+			if pc.ConstraintName != "" {
+				factory, ok := g.s.pathPatterns[pc.ConstraintName]
 				if !ok {
-					panic(fmt.Sprintf("Map %s: unknown path pattern %q for parameter %q", path, pc.constraintName, pc.name))
+					panic(fmt.Sprintf("Map %s: unknown path pattern %q for parameter %q", path, pc.ConstraintName, pc.Name))
 				}
 				var err error
-				pattern, err = factory(pc.constraintArg)
+				pattern, err = factory(pc.ConstraintArg)
 				if err != nil {
-					panic(fmt.Sprintf("Map %s: invalid path pattern %q for parameter %q: %v", path, pc.constraintName, pc.name, err))
+					panic(fmt.Sprintf("Map %s: invalid path pattern %q for parameter %q: %v", path, pc.ConstraintName, pc.Name, err))
 				}
 			}
 
-			setter, err := buildPathParamSetter(i, inTyp, pc.name, pattern, g.s.pathParamDecoders)
+			setter, err := buildPathParamSetter(i, inTyp, pc.Name, pattern, g.s.pathParamDecoders)
 			if err != nil {
-				panic(fmt.Sprintf("Map %s: unsupported path parameter type for %q: %v", path, pc.name, err))
+				panic(fmt.Sprintf("Map %s: unsupported path parameter type for %q: %v", path, pc.Name, err))
 			}
 			setters[i] = setter
 		}
@@ -239,6 +237,36 @@ func (g *RouteGroup) Map(path string, handler any) {
 	}
 }
 
+// ============================================================================
+// Handler reflection
+// ============================================================================
+
+// Package-level type descriptors — evaluated once at startup.
+var (
+	ourContextType = reflect.TypeFor[*Context]()
+	stdContextType = reflect.TypeFor[context.Context]()
+	responseType   = reflect.TypeFor[Response]()
+	errorType      = reflect.TypeFor[error]()
+)
+
+// returnPattern describes what a handler function returns.
+// Resolved once at registration time; never inspected at request time.
+type returnPattern int
+
+const (
+	returnsNothing          returnPattern = iota
+	returnsResponse                       // func(...) Response
+	returnsData                           // func(...) T  (not Response, not error)
+	returnsError                          // func(...) error
+	returnsResponseAndError               // func(...) (Response, error)
+	returnsDataAndError                   // func(...) (T, error)
+)
+
+// argSetter is compiled once per parameter slot at route-registration time.
+// At request time it injects the correct value into args[i] with no branching.
+// Returns (false, errResponse) if injection fails (e.g. malformed path parameter).
+type argSetter func(args []reflect.Value, w http.ResponseWriter, r *http.Request) (ok bool, errResponse Response)
+
 // resolveReturnPattern inspects a handler's return types at registration time.
 // Panics on unsupported signatures so misconfigurations are caught at startup.
 func resolveReturnPattern(path string, t reflect.Type) returnPattern {
@@ -269,7 +297,6 @@ func resolveReturnPattern(path string, t reflect.Type) returnPattern {
 	}
 }
 
-// isNilValue reports whether v is a nil pointer, interface, slice, map, chan, or func.
 func isNilValue(v reflect.Value) bool {
 	switch v.Kind() {
 	case reflect.Ptr, reflect.Interface, reflect.Slice, reflect.Map, reflect.Chan, reflect.Func:
@@ -278,55 +305,165 @@ func isNilValue(v reflect.Value) bool {
 	return false
 }
 
-func selectOutputCodec(codecs []codec.OutputCodec, accept string) codec.OutputCodec {
-	if accept == "" && len(codecs) > 0 {
-		return codecs[0]
-	}
-	for _, c := range codecs {
-		if c.CanEncode(accept) {
-			return c
-		}
-	}
-	return nil
+// ============================================================================
+// Pattern parsing
+// ============================================================================
+
+// paramConstraint holds the parsed name and optional constraint for a path parameter segment.
+type paramConstraint struct {
+	Name           string
+	ConstraintName string
+	ConstraintArg  string
 }
 
-func writeResponse(w http.ResponseWriter, r *http.Request, res Response, codecs []codec.OutputCodec) {
-	for k, v := range res.Headers() {
-		w.Header().Set(k, v)
+// buildPattern joins the group prefix and route path, normalising double slashes.
+// If the route path starts with an HTTP method (e.g. "GET /foo"), the method is preserved.
+func buildPattern(prefix, routePath string) string {
+	parts := strings.SplitN(routePath, " ", 2)
+	method, path := "", routePath
+	if len(parts) == 2 {
+		method = parts[0] + " "
+		path = parts[1]
+	}
+	fullPath := strings.ReplaceAll(prefix+path, "//", "/")
+	return method + fullPath
+}
+
+// adaptGo122Pattern converts colon-style path parameters (":name", ":id[uuid]")
+// into the Go 1.22 ServeMux wildcard syntax ("{name}") and returns the extracted
+// constraint metadata in declaration order.
+func adaptGo122Pattern(pattern string) (string, []paramConstraint) {
+	var params []paramConstraint
+	segments := strings.Split(pattern, "/")
+	for i, seg := range segments {
+		if !strings.HasPrefix(seg, ":") {
+			continue
+		}
+		pc := parseParamSegment(seg[1:])
+		params = append(params, pc)
+		segments[i] = "{" + pc.Name + "}"
+	}
+	return strings.Join(segments, "/"), params
+}
+
+func parseParamSegment(seg string) paramConstraint {
+	name, rest, hasConstraint := strings.Cut(seg, "[")
+	if !hasConstraint {
+		return paramConstraint{Name: name}
+	}
+	spec := strings.TrimSuffix(rest, "]")
+	constraintName, constraintArg, _ := strings.Cut(spec, ":")
+	return paramConstraint{Name: name, ConstraintName: constraintName, ConstraintArg: constraintArg}
+}
+
+// ============================================================================
+// Path parameter injection
+// ============================================================================
+
+// buildPathParamSetter returns an argSetter that extracts and type-converts the
+// named path parameter for injection into handler argument slot idx.
+// An optional Pattern is applied for format validation before type conversion.
+func buildPathParamSetter(idx int, typ reflect.Type, name string, pattern pathparam.Pattern, decoders map[reflect.Type]pathparam.ParamDecoder) (argSetter, error) {
+	validate := func(string) bool { return true }
+	if pattern != nil {
+		validate = pattern.Validate
+	}
+	validErrMsg := "invalid path parameter '" + name + "': does not match expected format"
+	typeErrMsg := func(t string) string { return "invalid path parameter '" + name + "': expected " + t }
+
+	if dec, ok := decoders[typ]; ok {
+		return func(args []reflect.Value, _ http.ResponseWriter, r *http.Request) (bool, Response) {
+			rawVal := r.PathValue(name)
+			if !validate(rawVal) {
+				return false, errResponse(http.StatusBadRequest, validErrMsg)
+			}
+			val, err := dec.Decode(rawVal)
+			if err != nil {
+				return false, errResponse(http.StatusBadRequest, "invalid path parameter '"+name+"': "+err.Error())
+			}
+			args[idx] = reflect.ValueOf(val)
+			return true, nil
+		}, nil
 	}
 
-	data := res.Data()
-	if data == nil {
-		w.WriteHeader(res.StatusCode())
-		return
+	switch typ.Kind() {
+	case reflect.String:
+		return makeParamSetter(idx, name, validate, validErrMsg, "", func(s string) (string, error) { return s, nil }), nil
+	case reflect.Bool:
+		return makeParamSetter(idx, name, validate, validErrMsg, typeErrMsg("bool"), strconv.ParseBool), nil
+	case reflect.Int:
+		return makeParamSetter(idx, name, validate, validErrMsg, typeErrMsg("int"), func(s string) (int, error) {
+			v, err := strconv.ParseInt(s, 10, 0)
+			return int(v), err
+		}), nil
+	case reflect.Int8:
+		return makeParamSetter(idx, name, validate, validErrMsg, typeErrMsg("int8"), func(s string) (int8, error) {
+			v, err := strconv.ParseInt(s, 10, 8)
+			return int8(v), err
+		}), nil
+	case reflect.Int16:
+		return makeParamSetter(idx, name, validate, validErrMsg, typeErrMsg("int16"), func(s string) (int16, error) {
+			v, err := strconv.ParseInt(s, 10, 16)
+			return int16(v), err
+		}), nil
+	case reflect.Int32:
+		return makeParamSetter(idx, name, validate, validErrMsg, typeErrMsg("int32"), func(s string) (int32, error) {
+			v, err := strconv.ParseInt(s, 10, 32)
+			return int32(v), err
+		}), nil
+	case reflect.Int64:
+		return makeParamSetter(idx, name, validate, validErrMsg, typeErrMsg("int64"), func(s string) (int64, error) {
+			return strconv.ParseInt(s, 10, 64)
+		}), nil
+	case reflect.Uint:
+		return makeParamSetter(idx, name, validate, validErrMsg, typeErrMsg("uint"), func(s string) (uint, error) {
+			v, err := strconv.ParseUint(s, 10, 0)
+			return uint(v), err
+		}), nil
+	case reflect.Uint8:
+		return makeParamSetter(idx, name, validate, validErrMsg, typeErrMsg("uint8"), func(s string) (uint8, error) {
+			v, err := strconv.ParseUint(s, 10, 8)
+			return uint8(v), err
+		}), nil
+	case reflect.Uint16:
+		return makeParamSetter(idx, name, validate, validErrMsg, typeErrMsg("uint16"), func(s string) (uint16, error) {
+			v, err := strconv.ParseUint(s, 10, 16)
+			return uint16(v), err
+		}), nil
+	case reflect.Uint32:
+		return makeParamSetter(idx, name, validate, validErrMsg, typeErrMsg("uint32"), func(s string) (uint32, error) {
+			v, err := strconv.ParseUint(s, 10, 32)
+			return uint32(v), err
+		}), nil
+	case reflect.Uint64:
+		return makeParamSetter(idx, name, validate, validErrMsg, typeErrMsg("uint64"), func(s string) (uint64, error) {
+			return strconv.ParseUint(s, 10, 64)
+		}), nil
+	case reflect.Float32:
+		return makeParamSetter(idx, name, validate, validErrMsg, typeErrMsg("float32"), func(s string) (float32, error) {
+			v, err := strconv.ParseFloat(s, 32)
+			return float32(v), err
+		}), nil
+	case reflect.Float64:
+		return makeParamSetter(idx, name, validate, validErrMsg, typeErrMsg("float64"), func(s string) (float64, error) {
+			return strconv.ParseFloat(s, 64)
+		}), nil
+	default:
+		return nil, fmt.Errorf("unsupported kind: %s", typ.Kind())
 	}
+}
 
-	c := selectOutputCodec(codecs, r.Header.Get("Accept"))
-	if c == nil {
-		w.WriteHeader(http.StatusNotAcceptable)
-		return
-	}
-
-	h := w.Header()
-	if h.Get("Content-Type") == "" {
-		h.Set("Content-Type", c.ContentType())
-	}
-
-	if buf, ok := c.(codec.BufferedOutputCodec); ok {
-		b, err := buf.Marshal(data)
+func makeParamSetter[T any](idx int, name string, validate func(string) bool, validErrMsg, typeErrMsg string, parse func(string) (T, error)) argSetter {
+	return func(args []reflect.Value, _ http.ResponseWriter, r *http.Request) (bool, Response) {
+		rawVal := r.PathValue(name)
+		if !validate(rawVal) {
+			return false, errResponse(http.StatusBadRequest, validErrMsg)
+		}
+		parsed, err := parse(rawVal)
 		if err != nil {
-			h.Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusInternalServerError)
-			_, _ = io.WriteString(w, `{"error":"internal server error encoding response"}`)
-			return
+			return false, errResponse(http.StatusBadRequest, typeErrMsg)
 		}
-		h.Set("Content-Length", strconv.Itoa(len(b)))
-		w.WriteHeader(res.StatusCode())
-		_, _ = w.Write(b)
-	} else {
-		w.WriteHeader(res.StatusCode())
-		if err := c.Encode(w, data); err != nil {
-			_ = err
-		}
+		args[idx] = reflect.ValueOf(parsed)
+		return true, nil
 	}
 }

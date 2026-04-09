@@ -10,41 +10,17 @@ import (
 	"time"
 
 	"github.com/tomasweigenast/goserv/codec"
+	"github.com/tomasweigenast/goserv/pathparam"
 )
-
-// RequestHandler is a typed handler convenience alias.
-type RequestHandler func(r *Context) Response
-
-// RouteDefiner ensures groups passed to RegisterRouteGroup have the Routes method.
-type RouteDefiner interface {
-	Routes(g *RouteGroup)
-}
-
-// ============================================================================
-// Shared state
-// ============================================================================
-
-// routeConfig holds codec and middleware state shared by Server and RouteGroup.
-type routeConfig struct {
-	inputCodecs  []codec.InputCodec
-	outputCodecs []codec.OutputCodec
-	middlewares  []Middleware
-	logger       *slog.Logger
-}
-
-// ============================================================================
-// Server
-// ============================================================================
 
 type Server struct {
 	routeConfig
 	addr              string
 	mux               *http.ServeMux
-	pathPatterns      map[string]PathPatternFactory
-	pathParamDecoders map[reflect.Type]PathParamDecoder
+	pathPatterns      map[string]pathparam.PatternFactory
+	pathParamDecoders map[reflect.Type]pathparam.ParamDecoder
 	errorHandler      ErrorHandler
-
-	shutdownTimeout time.Duration
+	shutdownTimeout   time.Duration
 }
 
 // NewServer returns a Server configured with the given options.
@@ -59,11 +35,10 @@ func NewServer(opts ...ServerOption) *Server {
 		},
 		addr:              ":8080",
 		mux:               http.NewServeMux(),
-		pathPatterns:      map[string]PathPatternFactory{"uuid": UUIDPatternFactory, "regex": RegexPatternFactory},
-		pathParamDecoders: make(map[reflect.Type]PathParamDecoder),
+		pathPatterns:      map[string]pathparam.PatternFactory{"uuid": pathparam.UUIDPatternFactory, "regex": pathparam.RegexPatternFactory},
+		pathParamDecoders: make(map[reflect.Type]pathparam.ParamDecoder),
 		errorHandler:      defaultErrorHandler,
-
-		shutdownTimeout: 5 * time.Second,
+		shutdownTimeout:   5 * time.Second,
 	}
 	for _, opt := range opts {
 		opt.applyServer(s)
@@ -130,14 +105,4 @@ func (s *Server) RegisterRouteGroup(prefix string, route any, opts ...GroupOptio
 	}
 	definer.Routes(g)
 	return g
-}
-
-// ============================================================================
-// RouteGroup
-// ============================================================================
-
-type RouteGroup struct {
-	routeConfig
-	s      *Server
-	prefix string
 }

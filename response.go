@@ -1,6 +1,12 @@
 package goserv
 
-import "net/http"
+import (
+	"io"
+	"net/http"
+	"strconv"
+
+	"github.com/tomasweigenast/goserv/codec"
+)
 
 // Response represents the result of a request handler.
 // Use as an escape hatch when you need a non-200 status or custom headers —
@@ -88,4 +94,57 @@ func TemporaryRedirect(location string) *resultWriter {
 
 func errResponse(status int, msg string) Response {
 	return problemDetails(status, msg)
+}
+
+func selectOutputCodec(codecs []codec.OutputCodec, accept string) codec.OutputCodec {
+	if accept == "" && len(codecs) > 0 {
+		return codecs[0]
+	}
+	for _, c := range codecs {
+		if c.CanEncode(accept) {
+			return c
+		}
+	}
+	return nil
+}
+
+func writeResponse(w http.ResponseWriter, r *http.Request, res Response, codecs []codec.OutputCodec) {
+	for k, v := range res.Headers() {
+		w.Header().Set(k, v)
+	}
+
+	data := res.Data()
+	if data == nil {
+		w.WriteHeader(res.StatusCode())
+		return
+	}
+
+	c := selectOutputCodec(codecs, r.Header.Get("Accept"))
+	if c == nil {
+		w.WriteHeader(http.StatusNotAcceptable)
+		return
+	}
+
+	h := w.Header()
+	if h.Get("Content-Type") == "" {
+		h.Set("Content-Type", c.ContentType())
+	}
+
+	if buf, ok := c.(codec.BufferedOutputCodec); ok {
+		b, err := buf.Marshal(data)
+		if err != nil {
+			h.Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = io.WriteString(w, `{"error":"internal server error encoding response"}`)
+			return
+		}
+		h.Set("Content-Length", strconv.Itoa(len(b)))
+		w.WriteHeader(res.StatusCode())
+		_, _ = w.Write(b)
+	} else {
+		w.WriteHeader(res.StatusCode())
+		if err := c.Encode(w, data); err != nil {
+			_ = err
+		}
+	}
 }
