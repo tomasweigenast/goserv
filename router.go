@@ -592,19 +592,26 @@ func buildRequestStructSetter(
 			}})
 
 		case "fromQuery":
-			queryKey := name
-			fieldSetters = append(fieldSetters, fieldMeta{index: fidx, setter: func(sv reflect.Value, r *http.Request) (bool, Response) {
-				raw := r.URL.Query().Get(queryKey)
-				if raw == "" {
-					return true, nil // missing → zero value
-				}
-				val, err := parseRawValue(ftyp, raw, decoders)
-				if err != nil {
-					return false, errResponse(http.StatusBadRequest, "invalid query parameter '"+queryKey+"': "+err.Error())
-				}
-				sv.Field(fidx).Set(val)
-				return true, nil
-			}})
+			if ftyp.Kind() == reflect.Struct {
+				// Nested struct tagged fromQuery — flatten its fields as individual
+				// query parameters. Useful for shared pagination / filter structs.
+				fieldSetters = append(fieldSetters, fieldMeta{index: fidx,
+					setter: buildNestedQuerySetter(fidx, ftyp, decoders, naming)})
+			} else {
+				queryKey := name
+				fieldSetters = append(fieldSetters, fieldMeta{index: fidx, setter: func(sv reflect.Value, r *http.Request) (bool, Response) {
+					raw := r.URL.Query().Get(queryKey)
+					if raw == "" {
+						return true, nil // missing → zero value
+					}
+					val, err := parseRawValue(ftyp, raw, decoders)
+					if err != nil {
+						return false, errResponse(http.StatusBadRequest, "invalid query parameter '"+queryKey+"': "+err.Error())
+					}
+					sv.Field(fidx).Set(val)
+					return true, nil
+				}})
+			}
 
 		case "fromHeader":
 			headerName := name
@@ -654,6 +661,73 @@ func buildRequestStructSetter(
 			}
 		}
 		args[idx] = sv
+		return true, nil
+	}
+}
+
+// buildNestedQuerySetter returns a reqFieldSetter that populates the struct at
+// field slot idx by reading each of its exported fields from URL query params.
+// Fields may carry a bare goserv tag to override the query key name:
+//
+//	type PageQuery struct {
+//	    Page     int    // ?page=
+//	    PageSize int    // ?page_size=
+//	    Cursor   string `goserv:"after"` // ?after=
+//	}
+//
+// If a sub-field is itself a struct it is recursed into (fully flattened).
+func buildNestedQuerySetter(
+	idx int,
+	typ reflect.Type,
+	decoders map[reflect.Type]pathparam.ParamDecoder,
+	naming FieldNamingConvention,
+) reqFieldSetter {
+	type subField struct {
+		index    int
+		queryKey string
+		typ      reflect.Type
+		nested   reqFieldSetter // non-nil when typ is a struct
+	}
+
+	var fields []subField
+	for i := range typ.NumField() {
+		f := typ.Field(i)
+		if !f.IsExported() {
+			continue
+		}
+		// Key name: bare goserv tag overrides the naming convention.
+		key := naming(f.Name)
+		if tag := f.Tag.Get("goserv"); tag != "" {
+			key = tag
+		}
+
+		sf := subField{index: i, queryKey: key, typ: f.Type}
+		if f.Type.Kind() == reflect.Struct {
+			sf.nested = buildNestedQuerySetter(i, f.Type, decoders, naming)
+		}
+		fields = append(fields, sf)
+	}
+
+	return func(sv reflect.Value, r *http.Request) (bool, Response) {
+		nested := reflect.New(typ).Elem()
+		for _, f := range fields {
+			if f.nested != nil {
+				if ok, errRes := f.nested(nested, r); !ok {
+					return false, errRes
+				}
+				continue
+			}
+			raw := r.URL.Query().Get(f.queryKey)
+			if raw == "" {
+				continue // missing → zero value
+			}
+			val, err := parseRawValue(f.typ, raw, decoders)
+			if err != nil {
+				return false, errResponse(http.StatusBadRequest, "invalid query parameter '"+f.queryKey+"': "+err.Error())
+			}
+			nested.Field(f.index).Set(val)
+		}
+		sv.Field(idx).Set(nested)
 		return true, nil
 	}
 }
