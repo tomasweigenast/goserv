@@ -6,11 +6,47 @@ import (
 	"net"
 	"reflect"
 	"strconv"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/tomasweigenast/goserv/codec"
 	"github.com/tomasweigenast/goserv/pathparam"
 )
+
+// ============================================================================
+// Field naming convention
+// ============================================================================
+
+// FieldNamingConvention converts a Go struct field name to the default key
+// used when no explicit name is provided in a goserv or query tag.
+// Applied to fromParam, fromQuery, fromHeader tag sources and Query[T] fields.
+type FieldNamingConvention func(fieldName string) string
+
+// LowercaseNaming converts field names to lowercase: "PageSize" → "pagesize". (default)
+var LowercaseNaming FieldNamingConvention = func(s string) string { return strings.ToLower(s) }
+
+// SnakeCaseNaming converts field names to snake_case: "PageSize" → "page_size".
+var SnakeCaseNaming FieldNamingConvention = func(s string) string {
+	var b strings.Builder
+	for i, r := range s {
+		if unicode.IsUpper(r) && i > 0 {
+			b.WriteByte('_')
+		}
+		b.WriteRune(unicode.ToLower(r))
+	}
+	return b.String()
+}
+
+// CamelCaseNaming converts field names to camelCase: "PageSize" → "pageSize".
+var CamelCaseNaming FieldNamingConvention = func(s string) string {
+	if s == "" {
+		return s
+	}
+	runes := []rune(s)
+	runes[0] = unicode.ToLower(runes[0])
+	return string(runes)
+}
 
 // ============================================================================
 // Option interfaces
@@ -78,6 +114,16 @@ func WithCodec(c any) RouteOption {
 		if oc, ok := c.(codec.OutputCodec); ok {
 			cfg.outputCodecs = append(cfg.outputCodecs, oc)
 		}
+	})
+}
+
+// WithFieldNamingConvention sets the convention used to convert Go struct field
+// names to their default key when no explicit name is given in a goserv or
+// query tag. Built-in conventions: LowercaseNaming (default), SnakeCaseNaming,
+// CamelCaseNaming.
+func WithFieldNamingConvention(c FieldNamingConvention) RouteOption {
+	return sharedOptionFunc(func(cfg *routeConfig) {
+		cfg.fieldNaming = c
 	})
 }
 

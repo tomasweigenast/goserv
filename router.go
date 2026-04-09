@@ -28,6 +28,7 @@ type routeConfig struct {
 	outputCodecs []codec.OutputCodec
 	middlewares  []Middleware
 	logger       *slog.Logger
+	fieldNaming  FieldNamingConvention
 }
 
 // RouteGroup is a set of routes sharing a common prefix, codec list, and middleware chain.
@@ -70,38 +71,34 @@ func (g *RouteGroup) Map(path string, handler any) {
 	outputCodecs := g.outputCodecs
 
 	// Compile one setter closure per parameter — zero branching at request time.
+	// Injection order (enforced here at registration):
+	//   1. *Context / context.Context  — by type, must appear first
+	//   2. Path params                 — positional, next len(params) non-context args
+	//   3. Query[T] / body struct      — by type, in any order after path params
 	setters := make([]argSetter, numIn)
-	paramIdx := 0
+	pathParamsGiven := 0
 
 	for i := range numIn {
 		inTyp := handlerType.In(i)
 
 		switch {
 		case inTyp == ourContextType || inTyp == stdContextType:
+			// Context — always by type, never counts as a path param slot.
 			setters[i] = func(args []reflect.Value, _ http.ResponseWriter, r *http.Request) (bool, Response) {
 				ctx, _ := r.Context().Value(contextKey{}).(Context)
 				args[i] = reflect.ValueOf(&ctx)
 				return true, nil
 			}
 
-		case inTyp.Kind() == reflect.Struct:
-			bodyType := inTyp
-			setters[i] = func(args []reflect.Value, _ http.ResponseWriter, r *http.Request) (bool, Response) {
-				ic := codec.SelectInputCodec(inputCodecs, r.Header.Get("Content-Type"))
-				if ic == nil {
-					return false, errResponse(http.StatusUnsupportedMediaType, "unsupported media type")
-				}
-				ptr := reflect.New(bodyType)
-				if err := ic.Decode(r.Body, ptr.Interface()); err != nil {
-					return false, errResponse(http.StatusBadRequest, "invalid request body")
-				}
-				args[i] = ptr.Elem()
-				return true, nil
-			}
+		case inTyp.Kind() == reflect.Struct && isRequestStruct(inTyp):
+			// goserv-tagged request struct — reads its own path params by name,
+			// so it must be detected before the positional path param case.
+			setters[i] = buildRequestStructSetter(i, inTyp, path, g.s.pathParamDecoders, inputCodecs, g.fieldNaming)
 
-		case paramIdx < len(params):
-			pc := params[paramIdx]
-			paramIdx++
+		case pathParamsGiven < len(params):
+			// Positional path param — consumes the next :param slot.
+			pc := params[pathParamsGiven]
+			pathParamsGiven++
 
 			var pattern pathparam.Pattern
 			if pc.ConstraintName != "" {
@@ -121,6 +118,28 @@ func (g *RouteGroup) Map(path string, handler any) {
 				panic(fmt.Sprintf("Map %s: unsupported path parameter type for %q: %v", path, pc.Name, err))
 			}
 			setters[i] = setter
+
+		case inTyp.Implements(queryMarkerType):
+			setters[i] = buildQuerySetter(i, inTyp, g.s.pathParamDecoders, g.fieldNaming)
+
+		case inTyp.Kind() == reflect.Struct:
+			// Plain struct with no goserv tags — decode from request body.
+			bodyType := inTyp
+			setters[i] = func(args []reflect.Value, _ http.ResponseWriter, r *http.Request) (bool, Response) {
+				ic := codec.SelectInputCodec(inputCodecs, r.Header.Get("Content-Type"))
+				if ic == nil {
+					return false, errResponse(http.StatusUnsupportedMediaType, "unsupported media type")
+				}
+				ptr := reflect.New(bodyType)
+				if err := ic.Decode(r.Body, ptr.Interface()); err != nil {
+					return false, errResponse(http.StatusBadRequest, "invalid request body")
+				}
+				args[i] = ptr.Elem()
+				return true, nil
+			}
+
+		default:
+			panic(fmt.Sprintf("Map %s: argument %d has unsupported type %s after path params are exhausted", path, i, inTyp))
 		}
 	}
 
@@ -369,101 +388,272 @@ func buildPathParamSetter(idx int, typ reflect.Type, name string, pattern pathpa
 		validate = pattern.Validate
 	}
 	validErrMsg := "invalid path parameter '" + name + "': does not match expected format"
-	typeErrMsg := func(t string) string { return "invalid path parameter '" + name + "': expected " + t }
 
-	if dec, ok := decoders[typ]; ok {
-		return func(args []reflect.Value, _ http.ResponseWriter, r *http.Request) (bool, Response) {
-			rawVal := r.PathValue(name)
-			if !validate(rawVal) {
-				return false, errResponse(http.StatusBadRequest, validErrMsg)
-			}
-			val, err := dec.Decode(rawVal)
-			if err != nil {
-				return false, errResponse(http.StatusBadRequest, "invalid path parameter '"+name+"': "+err.Error())
-			}
-			args[idx] = reflect.ValueOf(val)
-			return true, nil
-		}, nil
+	// Probe parseRawValue early to surface unsupported-type errors at
+	// registration time rather than at request time.
+	// Only unsupportedTypeError means the type has no parser at all;
+	// other errors (e.g. parse failure on "") are fine — the type is supported.
+	if _, err := parseRawValue(typ, "", decoders); isDecoderMissError(err) {
+		return nil, err
 	}
 
-	switch typ.Kind() {
-	case reflect.String:
-		return makeParamSetter(idx, name, validate, validErrMsg, "", func(s string) (string, error) { return s, nil }), nil
-	case reflect.Bool:
-		return makeParamSetter(idx, name, validate, validErrMsg, typeErrMsg("bool"), strconv.ParseBool), nil
-	case reflect.Int:
-		return makeParamSetter(idx, name, validate, validErrMsg, typeErrMsg("int"), func(s string) (int, error) {
-			v, err := strconv.ParseInt(s, 10, 0)
-			return int(v), err
-		}), nil
-	case reflect.Int8:
-		return makeParamSetter(idx, name, validate, validErrMsg, typeErrMsg("int8"), func(s string) (int8, error) {
-			v, err := strconv.ParseInt(s, 10, 8)
-			return int8(v), err
-		}), nil
-	case reflect.Int16:
-		return makeParamSetter(idx, name, validate, validErrMsg, typeErrMsg("int16"), func(s string) (int16, error) {
-			v, err := strconv.ParseInt(s, 10, 16)
-			return int16(v), err
-		}), nil
-	case reflect.Int32:
-		return makeParamSetter(idx, name, validate, validErrMsg, typeErrMsg("int32"), func(s string) (int32, error) {
-			v, err := strconv.ParseInt(s, 10, 32)
-			return int32(v), err
-		}), nil
-	case reflect.Int64:
-		return makeParamSetter(idx, name, validate, validErrMsg, typeErrMsg("int64"), func(s string) (int64, error) {
-			return strconv.ParseInt(s, 10, 64)
-		}), nil
-	case reflect.Uint:
-		return makeParamSetter(idx, name, validate, validErrMsg, typeErrMsg("uint"), func(s string) (uint, error) {
-			v, err := strconv.ParseUint(s, 10, 0)
-			return uint(v), err
-		}), nil
-	case reflect.Uint8:
-		return makeParamSetter(idx, name, validate, validErrMsg, typeErrMsg("uint8"), func(s string) (uint8, error) {
-			v, err := strconv.ParseUint(s, 10, 8)
-			return uint8(v), err
-		}), nil
-	case reflect.Uint16:
-		return makeParamSetter(idx, name, validate, validErrMsg, typeErrMsg("uint16"), func(s string) (uint16, error) {
-			v, err := strconv.ParseUint(s, 10, 16)
-			return uint16(v), err
-		}), nil
-	case reflect.Uint32:
-		return makeParamSetter(idx, name, validate, validErrMsg, typeErrMsg("uint32"), func(s string) (uint32, error) {
-			v, err := strconv.ParseUint(s, 10, 32)
-			return uint32(v), err
-		}), nil
-	case reflect.Uint64:
-		return makeParamSetter(idx, name, validate, validErrMsg, typeErrMsg("uint64"), func(s string) (uint64, error) {
-			return strconv.ParseUint(s, 10, 64)
-		}), nil
-	case reflect.Float32:
-		return makeParamSetter(idx, name, validate, validErrMsg, typeErrMsg("float32"), func(s string) (float32, error) {
-			v, err := strconv.ParseFloat(s, 32)
-			return float32(v), err
-		}), nil
-	case reflect.Float64:
-		return makeParamSetter(idx, name, validate, validErrMsg, typeErrMsg("float64"), func(s string) (float64, error) {
-			return strconv.ParseFloat(s, 64)
-		}), nil
-	default:
-		return nil, fmt.Errorf("unsupported kind: %s", typ.Kind())
-	}
-}
-
-func makeParamSetter[T any](idx int, name string, validate func(string) bool, validErrMsg, typeErrMsg string, parse func(string) (T, error)) argSetter {
 	return func(args []reflect.Value, _ http.ResponseWriter, r *http.Request) (bool, Response) {
 		rawVal := r.PathValue(name)
 		if !validate(rawVal) {
 			return false, errResponse(http.StatusBadRequest, validErrMsg)
 		}
-		parsed, err := parse(rawVal)
+		val, err := parseRawValue(typ, rawVal, decoders)
 		if err != nil {
-			return false, errResponse(http.StatusBadRequest, typeErrMsg)
+			return false, errResponse(http.StatusBadRequest, "invalid path parameter '"+name+"': "+err.Error())
 		}
-		args[idx] = reflect.ValueOf(parsed)
+		args[idx] = val
+		return true, nil
+	}, nil
+}
+
+// parseRawValue converts a raw string into a reflect.Value of the given type,
+// using registered custom decoders first and falling back to built-in primitives.
+// It is shared by path param and query param injection.
+func parseRawValue(typ reflect.Type, raw string, decoders map[reflect.Type]pathparam.ParamDecoder) (reflect.Value, error) {
+	if dec, ok := decoders[typ]; ok {
+		val, err := dec.Decode(raw)
+		if err != nil {
+			return reflect.Value{}, err
+		}
+		return reflect.ValueOf(val), nil
+	}
+
+	switch typ.Kind() {
+	case reflect.String:
+		return reflect.ValueOf(raw), nil
+	case reflect.Bool:
+		v, err := strconv.ParseBool(raw)
+		if err != nil {
+			return reflect.Value{}, err
+		}
+		return reflect.ValueOf(v), nil
+	case reflect.Int:
+		v, err := strconv.ParseInt(raw, 10, 0)
+		if err != nil {
+			return reflect.Value{}, err
+		}
+		return reflect.ValueOf(int(v)), nil
+	case reflect.Int8:
+		v, err := strconv.ParseInt(raw, 10, 8)
+		if err != nil {
+			return reflect.Value{}, err
+		}
+		return reflect.ValueOf(int8(v)), nil
+	case reflect.Int16:
+		v, err := strconv.ParseInt(raw, 10, 16)
+		if err != nil {
+			return reflect.Value{}, err
+		}
+		return reflect.ValueOf(int16(v)), nil
+	case reflect.Int32:
+		v, err := strconv.ParseInt(raw, 10, 32)
+		if err != nil {
+			return reflect.Value{}, err
+		}
+		return reflect.ValueOf(int32(v)), nil
+	case reflect.Int64:
+		v, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			return reflect.Value{}, err
+		}
+		return reflect.ValueOf(v), nil
+	case reflect.Uint:
+		v, err := strconv.ParseUint(raw, 10, 0)
+		if err != nil {
+			return reflect.Value{}, err
+		}
+		return reflect.ValueOf(uint(v)), nil
+	case reflect.Uint8:
+		v, err := strconv.ParseUint(raw, 10, 8)
+		if err != nil {
+			return reflect.Value{}, err
+		}
+		return reflect.ValueOf(uint8(v)), nil
+	case reflect.Uint16:
+		v, err := strconv.ParseUint(raw, 10, 16)
+		if err != nil {
+			return reflect.Value{}, err
+		}
+		return reflect.ValueOf(uint16(v)), nil
+	case reflect.Uint32:
+		v, err := strconv.ParseUint(raw, 10, 32)
+		if err != nil {
+			return reflect.Value{}, err
+		}
+		return reflect.ValueOf(uint32(v)), nil
+	case reflect.Uint64:
+		v, err := strconv.ParseUint(raw, 10, 64)
+		if err != nil {
+			return reflect.Value{}, err
+		}
+		return reflect.ValueOf(v), nil
+	case reflect.Float32:
+		v, err := strconv.ParseFloat(raw, 32)
+		if err != nil {
+			return reflect.Value{}, err
+		}
+		return reflect.ValueOf(float32(v)), nil
+	case reflect.Float64:
+		v, err := strconv.ParseFloat(raw, 64)
+		if err != nil {
+			return reflect.Value{}, err
+		}
+		return reflect.ValueOf(v), nil
+	default:
+		return reflect.Value{}, &unsupportedTypeError{typ: typ}
+	}
+}
+
+// unsupportedTypeError is returned by parseRawValue for types with no registered decoder.
+type unsupportedTypeError struct{ typ reflect.Type }
+
+func (e *unsupportedTypeError) Error() string { return "unsupported kind: " + e.typ.Kind().String() }
+
+// isDecoderMissError reports whether err is an unsupportedTypeError — used to
+// distinguish "this type has no parser" (a configuration error) from a parse
+// failure on an empty string during the probe in buildPathParamSetter.
+func isDecoderMissError(err error) bool {
+	_, ok := err.(*unsupportedTypeError)
+	return ok
+}
+
+// ============================================================================
+// Request struct injection
+// ============================================================================
+
+// isRequestStruct reports whether typ is a struct where at least one exported
+// field carries a "goserv" struct tag. Such structs use per-field source tags
+// instead of whole-struct body decoding.
+func isRequestStruct(typ reflect.Type) bool {
+	for i := range typ.NumField() {
+		if typ.Field(i).Tag.Get("goserv") != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// reqFieldSetter is a compiled setter for one field of a request struct.
+type reqFieldSetter func(structVal reflect.Value, r *http.Request) (bool, Response)
+
+// buildRequestStructSetter compiles an argSetter for a goserv-tagged struct at
+// slot idx. It panics at registration time for invalid tag values or multiple
+// fromBody fields.
+func buildRequestStructSetter(
+	idx int,
+	typ reflect.Type,
+	routePath string,
+	decoders map[reflect.Type]pathparam.ParamDecoder,
+	inputCodecs []codec.InputCodec,
+	naming FieldNamingConvention,
+) argSetter {
+	type fieldMeta struct {
+		index  int
+		setter reqFieldSetter
+	}
+
+	var fieldSetters []fieldMeta
+	bodyFieldIdx := -1
+
+	for i := range typ.NumField() {
+		f := typ.Field(i)
+		if !f.IsExported() {
+			continue
+		}
+		tag := f.Tag.Get("goserv")
+		if tag == "" {
+			continue
+		}
+
+		source, name, _ := strings.Cut(tag, ",")
+		if name == "" {
+			name = naming(f.Name)
+		}
+
+		fidx := i
+		ftyp := f.Type
+
+		switch source {
+		case "fromParam":
+			paramName := name
+			fieldSetters = append(fieldSetters, fieldMeta{index: fidx, setter: func(sv reflect.Value, r *http.Request) (bool, Response) {
+				raw := r.PathValue(paramName)
+				val, err := parseRawValue(ftyp, raw, decoders)
+				if err != nil {
+					return false, errResponse(http.StatusBadRequest, "invalid path parameter '"+paramName+"': "+err.Error())
+				}
+				sv.Field(fidx).Set(val)
+				return true, nil
+			}})
+
+		case "fromQuery":
+			queryKey := name
+			fieldSetters = append(fieldSetters, fieldMeta{index: fidx, setter: func(sv reflect.Value, r *http.Request) (bool, Response) {
+				raw := r.URL.Query().Get(queryKey)
+				if raw == "" {
+					return true, nil // missing → zero value
+				}
+				val, err := parseRawValue(ftyp, raw, decoders)
+				if err != nil {
+					return false, errResponse(http.StatusBadRequest, "invalid query parameter '"+queryKey+"': "+err.Error())
+				}
+				sv.Field(fidx).Set(val)
+				return true, nil
+			}})
+
+		case "fromHeader":
+			headerName := name
+			fieldSetters = append(fieldSetters, fieldMeta{index: fidx, setter: func(sv reflect.Value, r *http.Request) (bool, Response) {
+				raw := r.Header.Get(headerName)
+				if raw == "" {
+					return true, nil // missing → zero value
+				}
+				val, err := parseRawValue(ftyp, raw, decoders)
+				if err != nil {
+					return false, errResponse(http.StatusBadRequest, "invalid header '"+headerName+"': "+err.Error())
+				}
+				sv.Field(fidx).Set(val)
+				return true, nil
+			}})
+
+		case "fromBody":
+			if bodyFieldIdx != -1 {
+				panic(fmt.Sprintf("Map %s: request struct %s has multiple fromBody fields", routePath, typ.Name()))
+			}
+			bodyFieldIdx = fidx
+			bodyType := ftyp
+			fieldSetters = append(fieldSetters, fieldMeta{index: fidx, setter: func(sv reflect.Value, r *http.Request) (bool, Response) {
+				ic := codec.SelectInputCodec(inputCodecs, r.Header.Get("Content-Type"))
+				if ic == nil {
+					return false, errResponse(http.StatusUnsupportedMediaType, "unsupported media type")
+				}
+				ptr := reflect.New(bodyType)
+				if err := ic.Decode(r.Body, ptr.Interface()); err != nil {
+					return false, errResponse(http.StatusBadRequest, "invalid request body")
+				}
+				sv.Field(fidx).Set(ptr.Elem())
+				return true, nil
+			}})
+
+		default:
+			panic(fmt.Sprintf("Map %s: unknown goserv tag source %q on field %s.%s", routePath, source, typ.Name(), f.Name))
+		}
+	}
+
+	return func(args []reflect.Value, _ http.ResponseWriter, r *http.Request) (bool, Response) {
+		ptr := reflect.New(typ)
+		sv := ptr.Elem()
+		for _, fs := range fieldSetters {
+			if ok, errRes := fs.setter(sv, r); !ok {
+				return false, errRes
+			}
+		}
+		args[idx] = sv
 		return true, nil
 	}
 }

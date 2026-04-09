@@ -3,6 +3,7 @@ package goserv_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -456,6 +457,317 @@ func TestMap_ResponseHeaders(t *testing.T) {
 	resp := mustGET(t, ts.URL+"/headers")
 	if resp.Header.Get("X-Custom") != "value" {
 		t.Errorf("X-Custom = %q, want value", resp.Header.Get("X-Custom"))
+	}
+}
+
+// ============================================================================
+// Query[T] injection
+// ============================================================================
+
+func TestMap_QueryParam_PrimitiveFields(t *testing.T) {
+	type q struct {
+		Page   int    `query:"page"`
+		Search string `query:"search"`
+	}
+	s, ts := newTestServer(t)
+	s.RegisterRouteGroup("", routeDefiner(func(g *httpx.RouteGroup) {
+		g.Map("GET /items", func(params httpx.Query[q]) string {
+			return fmt.Sprintf("%d|%s", params.Value.Page, params.Value.Search)
+		})
+	}))
+
+	resp := mustGET(t, ts.URL+"/items?page=3&search=hello")
+	body := readBody(t, resp)
+	if body != `"3|hello"` {
+		t.Errorf("body = %q, want %q", body, `"3|hello"`)
+	}
+}
+
+func TestMap_QueryParam_MissingFieldIsZero(t *testing.T) {
+	type q struct {
+		Page int `query:"page"`
+	}
+	s, ts := newTestServer(t)
+	s.RegisterRouteGroup("", routeDefiner(func(g *httpx.RouteGroup) {
+		g.Map("GET /items", func(params httpx.Query[q]) int {
+			return params.Value.Page
+		})
+	}))
+
+	resp := mustGET(t, ts.URL+"/items") // no ?page=
+	body := readBody(t, resp)
+	if body != "0" {
+		t.Errorf("body = %q, want 0", body)
+	}
+}
+
+func TestMap_QueryParam_InvalidValue_Returns400(t *testing.T) {
+	type q struct {
+		Page int `query:"page"`
+	}
+	s, ts := newTestServer(t)
+	s.RegisterRouteGroup("", routeDefiner(func(g *httpx.RouteGroup) {
+		g.Map("GET /items", func(params httpx.Query[q]) int {
+			return params.Value.Page
+		})
+	}))
+
+	resp := mustGET(t, ts.URL+"/items?page=notanumber")
+	if resp.StatusCode != 400 {
+		t.Errorf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestMap_QueryParam_WithPathParamAndBody(t *testing.T) {
+	type body struct{ Name string }
+	type q struct {
+		Active bool `query:"active"`
+	}
+	s, ts := newTestServer(t)
+	s.RegisterRouteGroup("", routeDefiner(func(g *httpx.RouteGroup) {
+		g.Map("POST /orgs/:id/users", func(id int32, params httpx.Query[q], req body) string {
+			return fmt.Sprintf("%d|%v|%s", id, params.Value.Active, req.Name)
+		})
+	}))
+
+	resp := mustPOST(t, ts.URL+"/orgs/7/users?active=true", "application/json", `{"Name":"alice"}`)
+	body2 := readBody(t, resp)
+	if body2 != `"7|true|alice"` {
+		t.Errorf("body = %q, want %q", body2, `"7|true|alice"`)
+	}
+}
+
+func TestMap_QueryParam_FallbackToLowercaseFieldName(t *testing.T) {
+	type q struct {
+		Limit int // no tag — matches ?limit=
+	}
+	s, ts := newTestServer(t)
+	s.RegisterRouteGroup("", routeDefiner(func(g *httpx.RouteGroup) {
+		g.Map("GET /items", func(params httpx.Query[q]) int {
+			return params.Value.Limit
+		})
+	}))
+
+	resp := mustGET(t, ts.URL+"/items?limit=20")
+	body := readBody(t, resp)
+	if body != "20" {
+		t.Errorf("body = %q, want 20", body)
+	}
+}
+
+func TestMap_StructBeforePathParams_Panics(t *testing.T) {
+	type body struct{ Name string }
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic when struct appears before path params are exhausted")
+		}
+	}()
+
+	s := httpx.NewServer()
+	s.RegisterRouteGroup("", routeDefiner(func(g *httpx.RouteGroup) {
+		// :id is a path param but the handler puts a struct first (wrong order)
+		g.Map("GET /items/:id", func(req body, id int32) string { return "" })
+	}))
+}
+
+// ============================================================================
+// Request struct injection
+// ============================================================================
+
+func TestMap_RequestStruct_FromParam(t *testing.T) {
+	type req struct {
+		ID string `goserv:"fromParam,id"`
+	}
+	s, ts := newTestServer(t)
+	s.RegisterRouteGroup("", routeDefiner(func(g *httpx.RouteGroup) {
+		g.Map("GET /items/:id", func(r req) string { return r.ID })
+	}))
+
+	resp := mustGET(t, ts.URL+"/items/abc")
+	body := readBody(t, resp)
+	if body != `"abc"` {
+		t.Errorf("body = %q, want %q", body, `"abc"`)
+	}
+}
+
+func TestMap_RequestStruct_FromQuery(t *testing.T) {
+	type req struct {
+		Page int `goserv:"fromQuery,page"`
+	}
+	s, ts := newTestServer(t)
+	s.RegisterRouteGroup("", routeDefiner(func(g *httpx.RouteGroup) {
+		g.Map("GET /items", func(r req) int { return r.Page })
+	}))
+
+	resp := mustGET(t, ts.URL+"/items?page=5")
+	body := readBody(t, resp)
+	if body != "5" {
+		t.Errorf("body = %q, want 5", body)
+	}
+}
+
+func TestMap_RequestStruct_FromQuery_Missing_IsZero(t *testing.T) {
+	type req struct {
+		Page int `goserv:"fromQuery,page"`
+	}
+	s, ts := newTestServer(t)
+	s.RegisterRouteGroup("", routeDefiner(func(g *httpx.RouteGroup) {
+		g.Map("GET /items", func(r req) int { return r.Page })
+	}))
+
+	resp := mustGET(t, ts.URL+"/items")
+	body := readBody(t, resp)
+	if body != "0" {
+		t.Errorf("body = %q, want 0", body)
+	}
+}
+
+func TestMap_RequestStruct_FromHeader(t *testing.T) {
+	type req struct {
+		Token string `goserv:"fromHeader,Authorization"`
+	}
+	s, ts := newTestServer(t)
+	s.RegisterRouteGroup("", routeDefiner(func(g *httpx.RouteGroup) {
+		g.Map("GET /secure", func(r req) string { return r.Token })
+	}))
+
+	httpReq, _ := http.NewRequest("GET", ts.URL+"/secure", nil)
+	httpReq.Header.Set("Authorization", "Bearer token123")
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := readBody(t, resp)
+	if body != `"Bearer token123"` {
+		t.Errorf("body = %q, want %q", body, `"Bearer token123"`)
+	}
+}
+
+func TestMap_RequestStruct_FromBody(t *testing.T) {
+	type payload struct{ Name string }
+	type req struct {
+		Body payload `goserv:"fromBody"`
+	}
+	s, ts := newTestServer(t)
+	s.RegisterRouteGroup("", routeDefiner(func(g *httpx.RouteGroup) {
+		g.Map("POST /items", func(r req) string { return r.Body.Name })
+	}))
+
+	resp := mustPOST(t, ts.URL+"/items", "application/json", `{"Name":"hello"}`)
+	body := readBody(t, resp)
+	if body != `"hello"` {
+		t.Errorf("body = %q, want %q", body, `"hello"`)
+	}
+}
+
+func TestMap_RequestStruct_AllSources(t *testing.T) {
+	type payload struct{ Value string }
+	type req struct {
+		ID    int     `goserv:"fromParam,id"`
+		Page  int     `goserv:"fromQuery,page"`
+		Token string  `goserv:"fromHeader,X-Token"`
+		Body  payload `goserv:"fromBody"`
+	}
+	s, ts := newTestServer(t)
+	s.RegisterRouteGroup("", routeDefiner(func(g *httpx.RouteGroup) {
+		g.Map("POST /items/:id", func(r req) string {
+			return fmt.Sprintf("%d|%d|%s|%s", r.ID, r.Page, r.Token, r.Body.Value)
+		})
+	}))
+
+	httpReq, _ := http.NewRequest("POST", ts.URL+"/items/42?page=3", strings.NewReader(`{"Value":"hi"}`))
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("X-Token", "secret")
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := readBody(t, resp)
+	if body != `"42|3|secret|hi"` {
+		t.Errorf("body = %q, want %q", body, `"42|3|secret|hi"`)
+	}
+}
+
+func TestMap_RequestStruct_UntaggedFieldIsZero(t *testing.T) {
+	type req struct {
+		Tagged   string `goserv:"fromQuery,name"`
+		Untagged string // no goserv tag — stays zero
+	}
+	s, ts := newTestServer(t)
+	s.RegisterRouteGroup("", routeDefiner(func(g *httpx.RouteGroup) {
+		g.Map("GET /items", func(r req) string {
+			return r.Tagged + "|" + r.Untagged
+		})
+	}))
+
+	resp := mustGET(t, ts.URL+"/items?name=foo")
+	body := readBody(t, resp)
+	if body != `"foo|"` {
+		t.Errorf("body = %q, want %q", body, `"foo|"`)
+	}
+}
+
+func TestMap_RequestStruct_DefaultNaming_Lowercase(t *testing.T) {
+	type req struct {
+		PageSize int `goserv:"fromQuery"` // no explicit name → "pagesize"
+	}
+	s, ts := newTestServer(t)
+	s.RegisterRouteGroup("", routeDefiner(func(g *httpx.RouteGroup) {
+		g.Map("GET /items", func(r req) int { return r.PageSize })
+	}))
+
+	resp := mustGET(t, ts.URL+"/items?pagesize=10")
+	body := readBody(t, resp)
+	if body != "10" {
+		t.Errorf("body = %q, want 10", body)
+	}
+}
+
+func TestMap_RequestStruct_SnakeCaseNaming(t *testing.T) {
+	type req struct {
+		PageSize int `goserv:"fromQuery"` // no explicit name → "page_size"
+	}
+	s, ts := newTestServer(t, httpx.WithFieldNamingConvention(httpx.SnakeCaseNaming))
+	s.RegisterRouteGroup("", routeDefiner(func(g *httpx.RouteGroup) {
+		g.Map("GET /items", func(r req) int { return r.PageSize })
+	}))
+
+	resp := mustGET(t, ts.URL+"/items?page_size=7")
+	body := readBody(t, resp)
+	if body != "7" {
+		t.Errorf("body = %q, want 7", body)
+	}
+}
+
+func TestMap_RequestStruct_MultipleFromBody_Panics(t *testing.T) {
+	type body struct{ X string }
+	type req struct {
+		A body `goserv:"fromBody"`
+		B body `goserv:"fromBody"`
+	}
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic with multiple fromBody fields")
+		}
+	}()
+
+	s := httpx.NewServer()
+	s.RegisterRouteGroup("", routeDefiner(func(g *httpx.RouteGroup) {
+		g.Map("POST /items", func(r req) string { return "" })
+	}))
+}
+
+func TestMap_PlainStruct_NoGoservTag_StillBody(t *testing.T) {
+	type body struct{ Name string }
+	s, ts := newTestServer(t)
+	s.RegisterRouteGroup("", routeDefiner(func(g *httpx.RouteGroup) {
+		g.Map("POST /items", func(b body) string { return b.Name })
+	}))
+
+	resp := mustPOST(t, ts.URL+"/items", "application/json", `{"Name":"backward-compat"}`)
+	got := readBody(t, resp)
+	if got != `"backward-compat"` {
+		t.Errorf("body = %q, want %q", got, `"backward-compat"`)
 	}
 }
 

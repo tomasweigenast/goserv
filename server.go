@@ -32,6 +32,7 @@ func NewServer(opts ...ServerOption) *Server {
 			inputCodecs:  []codec.InputCodec{jc},
 			outputCodecs: []codec.OutputCodec{jc},
 			logger:       slog.Default(),
+			fieldNaming:  LowercaseNaming,
 		},
 		addr:              ":8080",
 		mux:               http.NewServeMux(),
@@ -92,6 +93,7 @@ func (s *Server) RegisterRouteGroup(prefix string, route any, opts ...GroupOptio
 		routeConfig: routeConfig{
 			inputCodecs:  append([]codec.InputCodec(nil), s.inputCodecs...),
 			outputCodecs: append([]codec.OutputCodec(nil), s.outputCodecs...),
+			fieldNaming:  s.fieldNaming,
 		},
 		s:      s,
 		prefix: prefix,
